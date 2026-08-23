@@ -12,21 +12,6 @@ from typing import (
     Type
 )
 
-from openai import (
-    APIConnectionError,
-    RateLimitError,
-    Timeout
-)
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-
-from .config_utils import BaseConfig
-
-
 class TextChatMessage(TypedDict):
     """Representation of a single text-based chat message in the chat history."""
     role: str  # Either "system", "user", or "assistant"
@@ -101,30 +86,6 @@ def safe_unicode_decode(content: Union[bytes, str]) -> str:
     decoded_content = unicode_escape_pattern.sub(replace_unicode_escape, content)
 
     return decoded_content
-
-
-def dynamic_retry(experiment_config: BaseConfig):
-    """
-    Factory function to create a retry decorator with dynamic parameters.
-
-    Args:
-        experiment_config (BaseConfig): Configuration containing stop and wait parameters. Expected to use the global config for running all experiments. 
-
-    Returns:
-        Callable: A retry decorator with dynamically set parameters.
-    """
-    stop = stop_after_attempt(experiment_config.async_max_retry_attempts)
-    wait = wait_exponential(
-        multiplier=experiment_config.async_retry_wait_exp_multiplier,
-        min=experiment_config.async_retry_min_wait_exp_time,
-        max=experiment_config.async_retry_max_wait_exp_time,
-    )
-
-    return retry(
-        stop=stop,
-        wait=wait,
-        retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
-    )
 
 
 # def fix_broken_generated_json(json_str: str) -> str:

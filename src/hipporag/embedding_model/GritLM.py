@@ -18,6 +18,8 @@ logger = get_logger(__name__)
 
 
 class GritLMEmbeddingModel(BaseEmbeddingModel):
+    query_instruction_mode = "distinct"
+
 
     def __init__(self, global_config: Optional[BaseConfig] = None, embedding_model_name: Optional[str] = None) -> None:
         super().__init__(global_config=global_config)
@@ -86,12 +88,9 @@ class GritLMEmbeddingModel(BaseEmbeddingModel):
             results = results.numpy()
         if self.embedding_config.norm:
             results = (results.T / np.linalg.norm(results, axis=1)).T
-        
+
         return results
-        
-    
+
+
     def batch_generate(self, chat: List[TextChatMessage],) -> None:
         pass
-    
-    
-    

@@ -19,10 +19,15 @@ import sys
 import shutil
 import tempfile
 import traceback
-import importlib
+import hashlib
+import importlib.util
+from pathlib import Path
 from typing import List
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # ---------------------------------------------------------------------------
 # Mock embedding model -- returns stable random vectors, no GPU needed
@@ -37,7 +42,8 @@ class MockEmbeddingModel:
     def batch_encode(self, texts: List[str], **kwargs) -> np.ndarray:
         results = []
         for text in texts:
-            rng = np.random.default_rng(seed=abs(hash(text)) % (2**32))
+            seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4], "big")
+            rng = np.random.default_rng(seed=seed)
             vec = rng.random(EMBEDDING_DIM).astype(np.float32)
             vec /= np.linalg.norm(vec)
             results.append(vec)
@@ -160,7 +166,7 @@ def _test_persistence(make_store, label: str):
 # ---------------------------------------------------------------------------
 
 def test_parquet(tmp_dir: str):
-    from src.hipporag.embedding_store import EmbeddingStore
+    from hipporag.embedding_store import EmbeddingStore
 
     label = "Parquet"
     print(f"\n{'='*55}")
@@ -176,6 +182,7 @@ def test_parquet(tmp_dir: str):
 
     _test_persistence(make_store, label)
     print(f"\n  PASS: {label} -- all tests passed")
+    return True
 
 
 def test_qdrant(tmp_dir: str):
@@ -183,7 +190,7 @@ def test_qdrant(tmp_dir: str):
         print("\n  [SKIP] Qdrant -- qdrant-client not installed  (pip install qdrant-client)")
         return
 
-    from src.hipporag.vector_stores.qdrant_store import QdrantEmbeddingStore
+    from hipporag.vector_stores.qdrant_store import QdrantEmbeddingStore
 
     label = "Qdrant (local)"
     print(f"\n{'='*55}")
@@ -205,6 +212,7 @@ def test_qdrant(tmp_dir: str):
 
     _test_persistence(make_store, label)
     print(f"\n  PASS: {label} -- all tests passed")
+    return True
 
 
 def test_chroma(tmp_dir: str):
@@ -212,7 +220,7 @@ def test_chroma(tmp_dir: str):
         print("\n  [SKIP] ChromaDB -- chromadb not installed  (pip install chromadb)")
         return
 
-    from src.hipporag.vector_stores.chroma_store import ChromaEmbeddingStore
+    from hipporag.vector_stores.chroma_store import ChromaEmbeddingStore
 
     label = "ChromaDB (local)"
     print(f"\n{'='*55}")
@@ -234,6 +242,7 @@ def test_chroma(tmp_dir: str):
 
     _test_persistence(make_store, label)
     print(f"\n  PASS: {label} -- all tests passed")
+    return True
 
 
 def test_milvus(tmp_dir: str):
@@ -241,7 +250,7 @@ def test_milvus(tmp_dir: str):
         print('\n  [SKIP] Milvus -- pymilvus not installed  (pip install "pymilvus[milvus_lite]")')
         return
 
-    from src.hipporag.vector_stores.milvus_store import MilvusEmbeddingStore
+    from hipporag.vector_stores.milvus_store import MilvusEmbeddingStore
 
     label = "Milvus Lite (local)"
     print(f"\n{'='*55}")
@@ -271,11 +280,12 @@ def test_milvus(tmp_dir: str):
 
     _test_persistence(make_store, label)
     print(f"\n  PASS: {label} -- all tests passed")
+    return True
 
 
 def test_factory(tmp_dir: str):
     """Verify get_embedding_store() returns the right class for each type."""
-    from src.hipporag.embedding_store import get_embedding_store, EmbeddingStore, BaseEmbeddingStore
+    from hipporag.embedding_store import get_embedding_store, EmbeddingStore, BaseEmbeddingStore
 
     print(f"\n{'='*55}")
     print("  Factory: get_embedding_store()")
@@ -298,21 +308,21 @@ def test_factory(tmp_dir: str):
     print("  [1] parquet -> EmbeddingStore  OK")
 
     if importlib.util.find_spec("qdrant_client"):
-        from src.hipporag.vector_stores.qdrant_store import QdrantEmbeddingStore
+        from hipporag.vector_stores.qdrant_store import QdrantEmbeddingStore
         cfg.vector_store_type = "qdrant"
         store = get_embedding_store(EMBEDDING_MODEL, os.path.join(tmp_dir, "factory_qdrant"), 16, "chunk", cfg)
         assert isinstance(store, QdrantEmbeddingStore)
         print("  [2] qdrant  -> QdrantEmbeddingStore  OK")
 
     if importlib.util.find_spec("chromadb"):
-        from src.hipporag.vector_stores.chroma_store import ChromaEmbeddingStore
+        from hipporag.vector_stores.chroma_store import ChromaEmbeddingStore
         cfg.vector_store_type = "chroma"
         store = get_embedding_store(EMBEDDING_MODEL, os.path.join(tmp_dir, "factory_chroma"), 16, "chunk", cfg)
         assert isinstance(store, ChromaEmbeddingStore)
         print("  [3] chroma  -> ChromaEmbeddingStore  OK")
 
     if importlib.util.find_spec("pymilvus"):
-        from src.hipporag.vector_stores.milvus_store import MilvusEmbeddingStore
+        from hipporag.vector_stores.milvus_store import MilvusEmbeddingStore
         cfg.vector_store_type = "milvus"
         try:
             store = get_embedding_store(EMBEDDING_MODEL, os.path.join(tmp_dir, "factory_milvus"), 16, "chunk", cfg)
@@ -324,6 +334,7 @@ def test_factory(tmp_dir: str):
             print("  [4] milvus  -> MilvusEmbeddingStore  OK")
 
     print(f"\n  PASS: Factory -- all checks passed")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +348,7 @@ def main():
     tmp_dir = tempfile.mkdtemp(prefix="hipporag_vstore_test_")
     print(f"\nTemp directory: {tmp_dir}")
 
-    passed, failed = [], []
+    passed, skipped, failed = [], [], []
 
     for name, fn in [
         ("Parquet", test_parquet),
@@ -347,8 +358,10 @@ def main():
         ("Factory", test_factory),
     ]:
         try:
-            fn(tmp_dir)
-            passed.append(name)
+            if fn(tmp_dir):
+                passed.append(name)
+            else:
+                skipped.append(name)
         except Exception:
             failed.append(name)
             print(f"\n  FAIL: {name} FAILED:")
@@ -357,7 +370,7 @@ def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     print(f"\n{'='*55}")
-    print(f"Results: {len(passed)} passed, {len(failed)} failed")
+    print(f"Results: {len(passed)} passed, {len(skipped)} skipped, {len(failed)} failed")
     if failed:
         print(f"Failed:  {', '.join(failed)}")
         sys.exit(1)

@@ -1,40 +1,50 @@
-import json
 import os
 import logging
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
-from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal
+from dataclasses import asdict
+from typing import List, Dict, Tuple
 import numpy as np
-import importlib
-from collections import defaultdict
-from transformers import HfArgumentParser
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from igraph import Graph
-import igraph as ig
-import numpy as np
-from collections import defaultdict
-import re
 import time
 
 from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
-from .embedding_store import EmbeddingStore, get_embedding_store
-from .information_extraction import OpenIE
-from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
+from .embedding_store import get_embedding_store
 from .evaluation.retrieval_eval import RetrievalRecall
 from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
 from .prompts.prompt_template_manager import PromptTemplateManager
-from .rerank import DSPyFilter
-from .utils.misc_utils import *
-from .utils.embed_utils import retrieve_knn
-from .utils.typing import Triple
+from .utils.misc_utils import QuerySolution, ensure_list_input, min_max_normalize, validate_parallel_input_lengths
 from .utils.config_utils import BaseConfig
+from .utils.logging_utils import redact_config
+from .utils.state_utils import component_class_identity, embedding_index_identity, validate_or_create_index_manifest
 
 logger = logging.getLogger(__name__)
 
 class StandardRAG:
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self) -> None:
+        closed_ids = getattr(self, "_closed_resource_ids", set())
+        for resource in (getattr(self, "chunk_embedding_store", None), getattr(self, "embedding_model", None), getattr(self, "llm_model", None)):
+            if resource is None or id(resource) in closed_ids:
+                continue
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+            closed_ids.add(id(resource))
+        self._closed_resource_ids = closed_ids
+
+    def _construct_or_cleanup(self, factory):
+        try:
+            return factory()
+        except Exception:
+            self.close()
+            raise
 
     def __init__(self,
                  global_config=None,
@@ -43,7 +53,13 @@ class StandardRAG:
                  embedding_model_name=None,
                  llm_base_url=None,
                  azure_endpoint=None,
-                 azure_embedding_endpoint=None):
+                 azure_embedding_endpoint=None,
+                 azure_api_version=None,
+                 azure_chat_deployment=None,
+                 azure_embedding_api_version=None,
+                 azure_embedding_deployment=None,
+                 embedding_base_url=None,
+                 embedding_provider=None):
         """
         """
         if global_config is None:
@@ -64,14 +80,34 @@ class StandardRAG:
         if llm_base_url is not None:
             self.global_config.llm_base_url = llm_base_url
 
+        if embedding_base_url is not None:
+            self.global_config.embedding_base_url = embedding_base_url
+
         if azure_endpoint is not None:
             self.global_config.azure_endpoint = azure_endpoint
 
         if azure_embedding_endpoint is not None:
             self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
 
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self.global_config).items()])
-        logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
+        if azure_api_version is not None:
+            self.global_config.azure_api_version = azure_api_version
+
+        if azure_chat_deployment is not None:
+            self.global_config.azure_chat_deployment = azure_chat_deployment
+
+        if azure_embedding_api_version is not None:
+            self.global_config.azure_embedding_api_version = azure_embedding_api_version
+
+        if azure_embedding_deployment is not None:
+            self.global_config.azure_embedding_deployment = azure_embedding_deployment
+
+        if embedding_provider is not None:
+            self.global_config.embedding_provider = embedding_provider
+
+        self.global_config.validate()
+
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in redact_config(asdict(self.global_config)).items()])
+        logger.debug(f"StandardRAG init with config:\n  {_print_config}\n")
 
         #LLM and embedding model specific working directories are created under every specified saving directories
         llm_label = self.global_config.llm_name.replace("/", "_")
@@ -82,26 +118,58 @@ class StandardRAG:
             logger.info(f"Creating working directory: {self.working_dir}")
             os.makedirs(self.working_dir, exist_ok=True)
 
-        self.llm_model: BaseLLM = _get_llm_class(self.global_config)
+        self.llm_model: BaseLLM = self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
 
         # StandardRAG does not run OpenIE and always needs passage embeddings.
-        self.embedding_model: BaseEmbeddingModel = _get_embedding_model_class(
-            embedding_model_name=self.global_config.embedding_model_name)(global_config=self.global_config,
-                                                                          embedding_model_name=self.global_config.embedding_model_name)
-
-        self.chunk_embedding_store = get_embedding_store(
-            self.embedding_model,
-            os.path.join(self.working_dir, "chunk_embeddings"),
-            self.global_config.embedding_batch_size,
-            'chunk',
-            self.global_config,
+        self.embedding_model: BaseEmbeddingModel = self._construct_or_cleanup(
+            lambda: _get_embedding_model_class(
+                embedding_model_name=self.global_config.embedding_model_name,
+                provider=self.global_config.embedding_provider,
+            )(
+                global_config=self.global_config,
+                embedding_model_name=self.global_config.embedding_model_name,
+            )
         )
 
-        self.ready_to_retrieve = False
+        self.chunk_embedding_store = self._construct_or_cleanup(
+            lambda: get_embedding_store(
+                self.embedding_model,
+                os.path.join(self.working_dir, "chunk_embeddings"),
+                self.global_config.embedding_batch_size,
+                'chunk',
+                self.global_config,
+            )
+        )
+        self.index_manifest_path = os.path.join(self.working_dir, "index_manifest.json")
+        try:
+            validate_or_create_index_manifest(
+                self.index_manifest_path,
+                {
+                    "schema_version": 4,
+                    "rag_type": "standard",
+                    "embedding": embedding_index_identity(self.global_config),
+                    "embedding_model_class": component_class_identity(self.embedding_model),
+                },
+                (self.chunk_embedding_store,),
+            )
+        except Exception:
+            self.close()
+            raise
+        self.prompt_template_manager = self._construct_or_cleanup(
+            lambda: PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
+        )
 
         self.ppr_time = 0
         self.rerank_time = 0
         self.all_retrieval_time = 0
+        self._invalidate_retrieval_objects()
+
+    def _invalidate_retrieval_objects(self) -> None:
+        """Discard every in-memory retrieval snapshot after store mutation."""
+        self.ready_to_retrieve = False
+        self.query_to_embedding: Dict = {'triple': {}, 'passage': {}}
+        self.passage_node_keys: List = []
+        self.passage_embeddings = np.empty((0, 0), dtype=np.float32)
 
     def index(self, docs: List[str]):
         """
@@ -113,6 +181,8 @@ class StandardRAG:
                 A list of documents to be indexed.
         """
 
+        ensure_list_input(docs, "docs")
+        self._invalidate_retrieval_objects()
         logger.info(f"Indexing Documents")
 
         self.chunk_embedding_store.insert_strings(docs)
@@ -122,6 +192,7 @@ class StandardRAG:
 
         """
 
+        ensure_list_input(docs_to_delete, "docs_to_delete")
         #Making sure that all the necessary structures have been built.
         if not self.ready_to_retrieve:
             self.prepare_retrieval_objects()
@@ -132,12 +203,13 @@ class StandardRAG:
         #Get ids for chunks to delete
         chunk_ids_to_delete = set(
             [self.chunk_embedding_store.text_to_hash_id[chunk] for chunk in docs_to_delete])
+        if not chunk_ids_to_delete:
+            return
 
         logger.info(f"Deleting {len(chunk_ids_to_delete)} Chunks")
 
+        self._invalidate_retrieval_objects()
         self.chunk_embedding_store.delete(chunk_ids_to_delete)
-
-        self.ready_to_retrieve = False
 
     def retrieve(self,
                      queries: List[str],
@@ -167,10 +239,14 @@ class StandardRAG:
         -----
         - Long queries with no relevant facts after reranking will default to results from dense passage retrieval.
         """
+        ensure_list_input(queries, "queries")
+        validate_parallel_input_lengths(queries, gold_docs=gold_docs)
         retrieve_start_time = time.time()  # Record start time
 
         if num_to_retrieve is None:
             num_to_retrieve = self.global_config.retrieval_top_k
+        if not isinstance(num_to_retrieve, int) or num_to_retrieve < 1:
+            raise ValueError("num_to_retrieve must be a positive integer.")
 
         if gold_docs is not None:
             retrieval_recall_evaluator = RetrievalRecall(global_config=self.global_config)
@@ -243,6 +319,8 @@ class StandardRAG:
                 - A dictionary with overall QA evaluation metrics (exact match and F1 scores).
 
         """
+        ensure_list_input(queries, "queries")
+        validate_parallel_input_lengths(queries, gold_docs=gold_docs, gold_answers=gold_answers)
         if gold_answers is not None:
             qa_em_evaluator = QAExactMatch(global_config=self.global_config)
             qa_f1_evaluator = QAF1Score(global_config=self.global_config)
@@ -250,7 +328,7 @@ class StandardRAG:
         # Retrieving (if necessary)
         overall_retrieval_result = None
 
-        if not isinstance(queries[0], QuerySolution):
+        if queries and not isinstance(queries[0], QuerySolution):
             if gold_docs is not None:
                 queries, overall_retrieval_result = self.retrieve(queries=queries, gold_docs=gold_docs)
             else:
@@ -299,6 +377,9 @@ class StandardRAG:
                 - A list of raw response messages from the language model.
                 - A list of metadata dictionaries associated with the results.
         """
+        ensure_list_input(queries, "queries")
+        if not queries:
+            return [], [], []
         #Running inference for QA
         all_qa_messages = []
 
@@ -317,7 +398,7 @@ class StandardRAG:
                 prompt_dataset_name = self.global_config.dataset
             else:
                 # the dataset does not have a customized prompt template yet
-                logger.debug(
+                logger.warning(
                     f"rag_qa_{self.global_config.dataset} does not have a customized prompt template. Using MUSIQUE's prompt template instead.")
                 prompt_dataset_name = 'musique'
             all_qa_messages.append(
@@ -374,19 +455,21 @@ class StandardRAG:
         """
 
         all_query_strings = []
+        seen_queries = set()
         for query in queries:
-            if isinstance(query, QuerySolution) and (
-                    query.question not in self.query_to_embedding['triple'] or query.question not in
-                    self.query_to_embedding['passage']):
-                all_query_strings.append(query.question)
-            elif query not in self.query_to_embedding['triple'] or query not in self.query_to_embedding['passage']:
-                all_query_strings.append(query)
+            query_text = query.question if isinstance(query, QuerySolution) else query
+            if not isinstance(query_text, str):
+                raise TypeError(f"Queries must be strings or QuerySolution instances, got {type(query).__name__}.")
+            if query_text not in self.query_to_embedding['passage'] and query_text not in seen_queries:
+                all_query_strings.append(query_text)
+                seen_queries.add(query_text)
 
         if len(all_query_strings) > 0:
             logger.info(f"Encoding {len(all_query_strings)} queries for query_to_passage.")
-            query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings,
-                                                                             instruction=get_query_instruction('query_to_passage'),
-                                                                             norm=True)
+            encode_kwargs = {"norm": True}
+            if getattr(self.embedding_model, "query_instruction_mode", "ignored") != "ignored":
+                encode_kwargs["instruction"] = get_query_instruction('query_to_passage')
+            query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings, **encode_kwargs)
             for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
                 self.query_to_embedding['passage'][query] = embedding
 
@@ -414,11 +497,13 @@ class StandardRAG:
             - A numpy array of the normalized similarity scores for the corresponding
               documents.
         """
-        query_embedding = self.query_to_embedding['passage'].get(query, None)
-        if query_embedding is None:
-            query_embedding = self.embedding_model.batch_encode(query,
-                                                                instruction=get_query_instruction('query_to_passage'),
-                                                                norm=True)
+        if not self.ready_to_retrieve:
+            self.prepare_retrieval_objects()
+        if len(self.passage_embeddings) == 0:
+            return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.float32)
+        if query not in self.query_to_embedding['passage']:
+            self.get_query_embeddings([query])
+        query_embedding = self.query_to_embedding['passage'][query]
         query_doc_scores = np.dot(self.passage_embeddings, query_embedding.T)
         query_doc_scores = np.squeeze(query_doc_scores) if query_doc_scores.ndim == 2 else query_doc_scores
         query_doc_scores = min_max_normalize(query_doc_scores)

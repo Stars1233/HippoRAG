@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
-from ..embedding_store import BaseEmbeddingStore, compute_mdhash_id
+from ..embedding_store import BaseEmbeddingStore, _validate_embeddings, compute_mdhash_id
+from .naming import build_collection_name
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,8 @@ class ChromaEmbeddingStore(BaseEmbeddingStore):
 
         self.client = _get_chroma_client(db_path, global_config)
 
-        # ChromaDB collection name must be 3-63 chars, only [a-zA-Z0-9._-]
-        # We use a sanitised version of the namespace.
-        safe_ns = namespace.replace("-", "_")
-        self.collection_name = f"hipporag_{safe_ns}"
+        # Chroma collection names are shared server-wide, so bind them to this index.
+        self.collection_name = build_collection_name(db_path, namespace, global_config)
 
         # We disable ChromaDB's built-in embedding — HippoRAG provides vectors.
         self.collection = self.client.get_or_create_collection(
@@ -132,7 +131,7 @@ class ChromaEmbeddingStore(BaseEmbeddingStore):
             return
 
         texts_to_encode = [nodes_dict[h] for h in missing_ids]
-        embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        embeddings = _validate_embeddings(self.embedding_model.batch_encode(texts_to_encode), len(texts_to_encode))
 
         # Upsert in batches
         for i in range(0, len(missing_ids), self.batch_size):
@@ -140,7 +139,7 @@ class ChromaEmbeddingStore(BaseEmbeddingStore):
             batch_texts = texts_to_encode[i : i + self.batch_size]
             batch_embs = embeddings[i : i + self.batch_size]
 
-            self.collection.add(
+            self.collection.upsert(
                 ids=batch_ids,
                 documents=batch_texts,
                 embeddings=[np.array(e).astype(np.float32).tolist() for e in batch_embs],

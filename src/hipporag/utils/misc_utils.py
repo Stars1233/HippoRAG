@@ -77,12 +77,24 @@ class QuerySolution:
             result["thoughts"] = self.thoughts
         return result
 
+
+def ensure_list_input(value, name: str) -> None:
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a list, got {type(value).__name__}.")
+
+
+def validate_parallel_input_lengths(primary, **parallel_inputs) -> None:
+    for name, value in parallel_inputs.items():
+        if value is not None and len(value) != len(primary):
+            raise ValueError(f"{name} must have the same length as the primary input.")
+
 def text_processing(text):
     if isinstance(text, list):
         return [text_processing(t) for t in text]
     if not isinstance(text, str):
         text = str(text)
-    return re.sub('[^A-Za-z0-9 ]', ' ', text.lower()).strip()
+    normalized = ''.join(character if character.isalnum() or character.isspace() else ' ' for character in text.casefold())
+    return ' '.join(normalized.split())
 
 def reformat_openie_results(corpus_openie_results) -> (Dict[str, NerRawOutput], Dict[str, TripleRawOutput]):
 

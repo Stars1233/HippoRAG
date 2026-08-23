@@ -12,10 +12,22 @@ logger = get_logger(__name__)
 
 
 class TransformersOfflineOpenIE(OpenIE):
-    def __init__(self, global_config):
+    def __init__(self, global_config, shared_llm=None):
 
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
-        self.llm_model = TransformersOffline(global_config)
+        self.llm_model = TransformersOffline(global_config, model=getattr(shared_llm, "model", None), tokenizer=getattr(shared_llm, "tokenizer", None))
+        self._owns_model_resources = shared_llm is None
+
+    def close(self) -> None:
+        """Release only model resources created by this OpenIE wrapper."""
+        llm_model = getattr(self, "llm_model", None)
+        if llm_model is None:
+            return
+        if self._owns_model_resources:
+            close = getattr(llm_model, "close", None)
+            if callable(close):
+                close()
+        self.llm_model = None
 
     def batch_openie(self, chunks: Dict[str, ChunkInfo]) -> Tuple[Dict[str, NerRawOutput], Dict[str, TripleRawOutput]]:
         """

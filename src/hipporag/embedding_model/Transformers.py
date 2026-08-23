@@ -18,9 +18,9 @@ class TransformersEmbeddingModel(BaseEmbeddingModel):
     def __init__(self, global_config:BaseConfig, embedding_model_name:str) -> None:
         super().__init__(global_config=global_config)
 
-        self.model_id = embedding_model_name[len("Transformers/"):]
+        self.model_id = embedding_model_name.removeprefix("Transformers/")
         self.embedding_type = 'float'
-        self.batch_size = 64
+        self.batch_size = global_config.embedding_batch_size
 
         self.model = SentenceTransformer(self.model_id, device = "cuda" if torch.cuda.is_available() else "cpu")
 
@@ -31,12 +31,14 @@ class TransformersEmbeddingModel(BaseEmbeddingModel):
 
     def encode(self, texts: List[str]) -> None:
         try:
-            response = self.model.encode(texts, batch_size=self.batch_size)
+            response = self.model.encode(texts, batch_size=self.batch_size, normalize_embeddings=self.global_config.embedding_return_as_normalized)
         except Exception as err:
             raise Exception(f"An error occurred: {err}")
         return np.array(response)
 
     def batch_encode(self, texts: List[str], **kwargs) -> None:
+        if isinstance(texts, str):
+            texts = [texts]
         if len(texts) < self.batch_size:
             return self.encode(texts)
         

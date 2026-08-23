@@ -29,11 +29,11 @@ class BaseConfig:
     )
     azure_endpoint: str = field(
         default=None,
-        metadata={"help": "Azure Endpoint URI for the LLM model, if none, uses OPENAI service directly."}
+        metadata={"help": "Azure OpenAI resource endpoint. Legacy full chat-completions URLs are accepted with a warning."}
     )
     azure_embedding_endpoint: str = field(
         default=None,
-        metadata={"help": "Azure Endpoint URI for the OpenAI embedding model, if none, uses OPENAI service directly."}
+        metadata={"help": "Azure OpenAI resource endpoint for embeddings. Legacy full embedding URLs are accepted with a warning."}
     )
     max_new_tokens: Union[None, int] = field(
         default=2048,
@@ -47,13 +47,13 @@ class BaseConfig:
         default=None,
         metadata={"help": "Random seed."}
     )
-    temperature: float = field(
+    temperature: Optional[float] = field(
         default=0,
-        metadata={"help": "Temperature for sampling in each inference."}
+        metadata={"help": "Temperature for sampling. Set to None for models or endpoints that do not accept it."}
     )
     response_format: Union[dict, None] = field(
-        default_factory=lambda: { "type": "json_object" },
-        metadata={"help": "Specifying the format that the model must output."}
+        default=None,
+        metadata={"help": "Optional Chat Completions response_format used for OpenIE requests. Direct LLM calls can override it per request."}
     )
     bedrock_mantle_auth: Literal["api_key", "aws_credentials"] = field(
         default="api_key",
@@ -71,18 +71,18 @@ class BaseConfig:
     ## LLM specific attributes -> Async hyperparameters
     max_retry_attempts: int = field(
         default=5,
-        metadata={"help": "Max number of retry attempts for an asynchronous API calling."}
+        metadata={"help": "Retries after the initial SDK request; total HTTP attempts can be this value plus one."}
     )
     # Storage specific attributes
     force_openie_from_scratch: bool = field(
         default=False,
-        metadata={"help": "If set to True, will ignore all existing openie files and rebuild them from scratch."}
+        metadata={"help": "If set to True, ignores existing OpenIE state. For an already-derived index, use a fresh save_dir so graph/entity/fact state cannot become stale."}
     )
 
     # Storage specific attributes 
     force_index_from_scratch: bool = field(
         default=False,
-        metadata={"help": "If set to True, will ignore all existing storage files and graph data and will rebuild from scratch."}
+        metadata={"help": "If set to True, rebuilds graph state while reusing compatible embedding/OpenIE stores. Use a fresh save_dir for a full storage rebuild."}
     )
     rerank_dspy_file_path: str = field(
         default=None,
@@ -94,7 +94,7 @@ class BaseConfig:
     )
     save_openie: bool = field(
         default=True,
-        metadata={"help": "If set to True, will save the OpenIE model to disk."}
+        metadata={"help": "If set to True, writes an additional human-readable OpenIE export. Canonical provenance required for incremental indexing is always persisted."}
     )
     
     # Preprocessing specific attributes
@@ -122,7 +122,7 @@ class BaseConfig:
         default="openie_openai_gpt",
         metadata={"help": "Class name indicating which information extraction model to use."}
     )
-    openie_mode: Literal["offline", "online"] = field(
+    openie_mode: Literal["offline", "online", "Transformers-offline"] = field(
         default="online",
         metadata={"help": "Mode of the OpenIE model to use."}
     )
@@ -286,9 +286,98 @@ class BaseConfig:
         default=None,
         metadata={"help": "Length of the corpus to use."}
     )
+
+    # Additive settings are kept after the original fields to preserve positional compatibility.
+    llm_supports_max_completion_tokens: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Whether a chat-completions endpoint accepts max_completion_tokens. Auto-detected for official OpenAI and Azure endpoints when unset."}
+    )
+    azure_api_version: Optional[str] = field(
+        default=None,
+        metadata={"help": "Azure OpenAI API version for chat completions."}
+    )
+    azure_chat_deployment: Optional[str] = field(
+        default=None,
+        metadata={"help": "Azure OpenAI deployment name for chat completions; defaults to llm_name."}
+    )
+    azure_embedding_api_version: Optional[str] = field(
+        default=None,
+        metadata={"help": "Azure OpenAI API version for embeddings; defaults to azure_api_version."}
+    )
+    azure_embedding_deployment: Optional[str] = field(
+        default=None,
+        metadata={"help": "Azure OpenAI deployment name for embeddings; defaults to embedding_model_name."}
+    )
+    openie_max_workers: int = field(
+        default=8,
+        metadata={"help": "Maximum number of concurrent online OpenIE requests."}
+    )
+    openie_ner_max_tokens: int = field(
+        default=512,
+        metadata={"help": "Maximum output tokens for each online OpenIE NER request."}
+    )
+    openie_triple_max_tokens: int = field(
+        default=2048,
+        metadata={"help": "Maximum output tokens for each online OpenIE triple request."}
+    )
+    embedding_request_timeout: float = field(
+        default=60.0,
+        metadata={"help": "Timeout in seconds for HTTP embedding requests."}
+    )
+    embedding_provider: Optional[Literal["openai", "transformers", "vllm", "gritlm", "nvembed", "contriever", "cohere"]] = field(
+        default=None,
+        metadata={"help": "Explicit embedding provider. When unset, the legacy model-name routing rules are used."}
+    )
+    vector_store_namespace: Optional[str] = field(
+        default=None,
+        metadata={"help": "Stable, unique index namespace for vector database collections. Defaults to a fingerprint of the working directory."}
+    )
     
     
     def __post_init__(self):
+        self.validate()
+
+    def validate(self) -> None:
+        if self.openie_mode not in {"online", "offline", "Transformers-offline"}:
+            raise ValueError(f"Unsupported openie_mode: {self.openie_mode}")
+        if self.embedding_provider not in {None, "openai", "transformers", "vllm", "gritlm", "nvembed", "contriever", "cohere"}:
+            raise ValueError(f"Unsupported embedding_provider: {self.embedding_provider}")
+        if self.vector_store_namespace is not None and (not isinstance(self.vector_store_namespace, str) or not self.vector_store_namespace.strip()):
+            raise ValueError("vector_store_namespace must be a non-empty string when set.")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1 when set.")
+        if self.max_retry_attempts < 0:
+            raise ValueError("max_retry_attempts cannot be negative.")
+        if self.temperature is not None and not 0 <= self.temperature <= 2:
+            raise ValueError("temperature must be between 0 and 2 when set.")
+        if (self.azure_api_version or self.azure_chat_deployment) and not self.azure_endpoint:
+            raise ValueError("azure_endpoint is required when Azure chat settings are configured.")
+        if (self.azure_embedding_api_version or self.azure_embedding_deployment) and not self.azure_embedding_endpoint:
+            raise ValueError("azure_embedding_endpoint is required when Azure embedding settings are configured.")
+        if self.openie_max_workers < 1:
+            raise ValueError("openie_max_workers must be at least 1.")
+        if self.openie_ner_max_tokens < 1 or self.openie_triple_max_tokens < 1:
+            raise ValueError("OpenIE token limits must be at least 1.")
+        if self.num_gen_choices != 1:
+            raise ValueError("num_gen_choices must be 1 because HippoRAG consumes one response per inference call.")
+        if self.embedding_batch_size < 1:
+            raise ValueError("embedding_batch_size must be at least 1.")
+        if self.embedding_request_timeout <= 0:
+            raise ValueError("embedding_request_timeout must be greater than 0.")
+        if self.linking_top_k < 0:
+            raise ValueError("linking_top_k cannot be negative; use 0 to disable graph fact linking.")
+        if self.synonymy_edge_topk < 1 or self.synonymy_edge_query_batch_size < 1 or self.synonymy_edge_key_batch_size < 1:
+            raise ValueError("Synonym KNN top-k and batch sizes must be at least 1.")
+        if not -1 <= self.synonymy_edge_sim_threshold <= 1:
+            raise ValueError("synonymy_edge_sim_threshold must be between -1 and 1.")
+        if self.retrieval_top_k < 1 or self.qa_top_k < 1:
+            raise ValueError("retrieval_top_k and qa_top_k must be at least 1.")
+        if self.max_qa_steps < 1:
+            raise ValueError("max_qa_steps must be at least 1.")
+        if self.passage_node_weight < 0:
+            raise ValueError("passage_node_weight cannot be negative.")
+        if not 0 < self.damping < 1:
+            raise ValueError("damping must be strictly between 0 and 1.")
         if self.save_dir is None: # If save_dir not given
             if self.dataset is None: self.save_dir = 'outputs' # running freely
             else: self.save_dir = os.path.join('outputs', self.dataset) # customize your dataset's output dir here

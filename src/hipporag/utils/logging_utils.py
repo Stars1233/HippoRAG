@@ -1,5 +1,22 @@
 import os
 import logging
+from collections.abc import Mapping
+from typing import Any, Dict
+
+
+def redact_config(mapping: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a log-safe copy of a configuration mapping."""
+    redacted = {}
+    for key, value in mapping.items():
+        normalized_key = str(key).lower()
+        is_secret = normalized_key in {"api_key", "token", "password", "secret", "authorization"} or normalized_key.endswith(("_api_key", "_token", "_password", "_secret"))
+        if is_secret and value:
+            redacted[key] = "***REDACTED***"
+        elif isinstance(value, Mapping):
+            redacted[key] = redact_config(value)
+        else:
+            redacted[key] = value
+    return redacted
 
 # # Base directory for storing logs (if not specified through environment variable, set it to `logs` dir under project root)
 # LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs"))

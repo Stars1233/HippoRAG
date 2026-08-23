@@ -14,6 +14,8 @@ logger = get_logger(__name__)
 
 
 class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
+    query_instruction_mode = "distinct"
+
 
     def __init__(self, global_config: Optional[BaseConfig] = None, embedding_model_name: Optional[str] = None) -> None:
         super().__init__(global_config=global_config)

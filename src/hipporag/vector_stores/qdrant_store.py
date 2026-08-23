@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
-from ..embedding_store import BaseEmbeddingStore, compute_mdhash_id
+from ..embedding_store import BaseEmbeddingStore, _validate_embeddings, compute_mdhash_id
+from .naming import build_collection_name
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,7 @@ class QdrantEmbeddingStore(BaseEmbeddingStore):
         self.namespace = namespace
         self.global_config = global_config
 
-        # Derive a short unique collection name from path + namespace.
-        # We hash the path so the name stays valid on all OSes (no colons, slashes, etc.)
-        import hashlib
-        path_hash = hashlib.md5(db_path.encode()).hexdigest()[:16]
-        self.collection_name = f"hipporag_{path_hash}_{namespace}"
+        self.collection_name = build_collection_name(db_path, namespace, global_config)
 
         # Build the client; for local mode use db_path as the storage dir
         if global_config and not getattr(global_config, "qdrant_url", None):
@@ -194,7 +191,7 @@ class QdrantEmbeddingStore(BaseEmbeddingStore):
             return
 
         texts_to_encode = [nodes_dict[h] for h in missing_ids]
-        embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        embeddings = _validate_embeddings(self.embedding_model.batch_encode(texts_to_encode), len(texts_to_encode))
 
         if len(missing_ids) > 0:
             dim = len(embeddings[0]) if hasattr(embeddings[0], "__len__") else embeddings.shape[1]

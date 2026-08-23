@@ -1,6 +1,5 @@
 import os
 from typing import List, Tuple
-from copy import deepcopy
 import sqlite3
 import json
 import time
@@ -10,11 +9,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from filelock import FileLock
 
-from .base import BaseLLM, LLMConfig
+from .base import BaseLLM, LLMConfig, normalize_generation_token_params
 from ..utils.llm_utils import TextChatMessage
 from ..utils.logging_utils import get_logger
 
-def convert_text_chat_messages_to_input_ids(messages: List[TextChatMessage], tokenizer, add_assistant_header=True) -> str:
+def convert_text_chat_messages_to_input_ids(messages: List[TextChatMessage], tokenizer, add_assistant_header=True) -> torch.Tensor:
     prompt = tokenizer.apply_chat_template(
         conversation=messages,
         chat_template=None,
@@ -59,7 +58,9 @@ class LLM_Cache:
                 return row
 
     def __params_to_key(self, params):
-        key_str = f"Model: {params['model']}, Temperature: {params['temperature']}, Messages: {params['messages']}"
+        key_params = {key: value for key, value in params.items() if key != "prompt_text"}
+        key_params["_cache_schema"] = 2
+        key_str = json.dumps(key_params, sort_keys=True, default=str)
         return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
     def read(self, params):
@@ -99,25 +100,27 @@ class TransformersLLM(BaseLLM):
         logger.info(f"[TransformersLLM] Model-ID: {self.global_config.llm_name}, Cache: {self.cache.cache_filepath}")
 
     def _init_llm_config(self) -> None:
-        config_dict = self.global_config.__dict__
+        config_dict = dict(self.global_config.__dict__)
         config_dict['llm_name'] = self.global_config.llm_name.removeprefix("Transformers/")
         config_dict['generate_params'] = {
-                "n": 1,
-                "temperature": config_dict.get("temperature", 0.0),
-            }
+            "temperature": config_dict.get("temperature", 0.0),
+            "max_new_tokens": config_dict.get("max_new_tokens", 2048),
+        }
 
         self.llm_config = LLMConfig.from_dict(config_dict=config_dict)
         logger.info(f"[TransformersLLM] Config: {self.llm_config}")
 
     def __llm_call(self, params):
         inputs = params["prompt_text"].to(self.model.device)
-        response = self.model.generate(inputs, max_new_tokens=params.get("max_tokens", 200))
-        return response
+        max_new_tokens = params.get("max_new_tokens", params.get("max_tokens", 2048))
+        temperature = float(params.get("temperature", 0.0))
+        generation_params = {"max_new_tokens": max_new_tokens, "do_sample": temperature > 0}
+        if temperature > 0:
+            generation_params["temperature"] = temperature
+        return self.model.generate(inputs, **generation_params)
     
-    def infer(self, messages: List[TextChatMessage], **kwargs) -> Tuple[List[TextChatMessage], dict]:
-        params = deepcopy(self.llm_config.generate_params)
-        if kwargs:
-            params.update(kwargs)
+    def infer(self, messages: List[TextChatMessage], **kwargs) -> Tuple[str, dict, bool]:
+        params = normalize_generation_token_params(self.llm_config.generate_params, kwargs, "max_new_tokens")
         params["model"] = self.model_id
         params["messages"] = messages
         params["prompt_text"] = convert_text_chat_messages_to_input_ids(messages, self.tokenizer)
@@ -129,10 +132,14 @@ class TransformersLLM(BaseLLM):
         else:
             cached = False
             response = self.__llm_call(params)
-            message = self.tokenizer.decode(response[0], skip_special_tokens=True)
+            prompt_tokens = params["prompt_text"].shape[1]
+            if response.ndim != 2 or response.shape[1] < prompt_tokens:
+                raise ValueError(f"Unexpected causal LM output shape {tuple(response.shape)} for prompt length {prompt_tokens}.")
+            generated_tokens = response[:, prompt_tokens:]
+            message = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
             metadata = {
-                "prompt_tokens": params["prompt_text"].shape[1], 
-                "completion_tokens": response.shape[1],
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": generated_tokens.shape[1],
             }
             self.cache.write(params, message, metadata)
 

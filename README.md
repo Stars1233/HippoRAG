@@ -65,6 +65,30 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
+Install optional local-model support only when needed, for example `uv pip install -e '.[vllm]'` or `uv pip install -e '.[gritlm]'`.
+
+HippoRAG supports `openai>=3.3.1,<4`: compatible 3.x client updates are accepted,
+while a new major version requires an explicit compatibility review. To reproduce
+the minimum supported SDK baseline, apply the optional constraint without changing
+the library's public dependency range:
+
+```sh
+uv pip install -r requirements.txt -c constraints/openai-tested.txt
+```
+
+SDK compatibility should be checked in separate clean environments against both
+the minimum baseline above and the newest allowed release. The latter can be
+installed and tested with:
+
+```sh
+uv pip install -r requirements.txt --upgrade-package openai
+PYTHONPATH=src python -m unittest tests.test_openai_sdk_compat
+```
+
+### Upgrading existing indexes
+
+Version 2.0.0a5 binds persisted vectors and OpenIE state to the endpoint, deployment, model, normalization, and component identity that produced them. Existing indexes without an `index_manifest.json`, or indexes whose identity no longer matches the active configuration, are rejected rather than mixed silently. Re-index into a fresh `save_dir`; copying or fabricating only the manifest is not a safe migration. When injecting a custom embedding model, extraction LLM, or text preprocessor, set `index_identity` to a stable version string so configuration changes cannot reuse incompatible state.
+
 ## Quick Start
 
 ### OpenAI
@@ -82,9 +106,9 @@ from hipporag import HippoRAG
 
 docs = ["George Rankin is a politician."]
 queries = ["What is George Rankin's occupation?"]
-hipporag = HippoRAG(save_dir="outputs", llm_model_name="gpt-4o-mini", embedding_model_name="text-embedding-3-small")
-hipporag.index(docs=docs)
-results = hipporag.rag_qa(queries=queries)
+with HippoRAG(save_dir="outputs", llm_model_name="gpt-4o-mini", embedding_model_name="text-embedding-3-small") as hipporag:
+    hipporag.index(docs=docs)
+    results = hipporag.rag_qa(queries=queries)
 ```
 
 #### OpenAI-compatible endpoints
@@ -95,7 +119,9 @@ Pass custom base URLs for OpenAI-compatible LLM and embedding servers:
 export OPENAI_API_KEY=<the API key required by your endpoint>
 ```
 
-For endpoints that do not require authentication, set this to a non-empty placeholder. HippoRAG automatically supplies a placeholder only when the configured LLM URL contains `localhost`.
+For loopback endpoints that do not require authentication, HippoRAG supplies a client-local placeholder without changing the process-wide `OPENAI_API_KEY` environment variable.
+
+OpenAI-compatible chat and embedding endpoints must return standard `usage` data. HippoRAG fails closed instead of caching a response whose token cost cannot be accounted for.
 
 ```python
 hipporag = HippoRAG(
@@ -103,7 +129,8 @@ hipporag = HippoRAG(
     llm_model_name="your-llm",
     llm_base_url="http://localhost:8000/v1",
     embedding_model_name="your-embedding-model",
-    embedding_base_url="http://localhost:8001/v1/embeddings",
+    embedding_provider="openai",
+    embedding_base_url="http://localhost:8001/v1",
 )
 ```
 
@@ -170,6 +197,10 @@ hipporag = HippoRAG(save_dir=save_dir,
 
 HippoRAG stores embeddings in local Parquet files by default. It can also use
 Qdrant, ChromaDB, or Milvus through `BaseConfig.vector_store_type`.
+Remote collections are isolated by a per-index namespace and the backend endpoint
+is fingerprinted in `index_manifest.json`. Set a stable, unique
+`vector_store_namespace` when an index must keep the same remote collection after
+its local `save_dir` is moved; do not reuse a namespace for unrelated indexes.
 
 ### Milvus
 
@@ -231,7 +262,7 @@ Provider integration scripts exercise indexing, graph reload, incremental update
 | Provider | Command |
 | --- | --- |
 | OpenAI | `python tests/integration/run_openai.py` |
-| Azure OpenAI | `python tests/integration/run_azure.py --azure_endpoint <url> --azure_embedding_endpoint <url>` |
+| Azure OpenAI | `python tests/integration/run_azure.py --azure_endpoint <resource-url> --azure_api_version <version> --azure_embedding_endpoint <resource-url>` |
 | Local vLLM | `python tests/integration/run_local.py` |
 | Transformers | `python tests/integration/run_transformers.py` |
 
@@ -273,8 +304,14 @@ Azure OpenAI uses the same entry point:
 
 ```sh
 export AZURE_OPENAI_API_KEY=<your Azure OpenAI API key>
-python main.py --dataset sample --embedding_name text-embedding-3-small --azure_endpoint <chat-completions-url> --azure_embedding_endpoint <embeddings-url>
+python main.py --dataset sample --llm_name gpt-4o-mini --embedding_name text-embedding-3-small \
+  --azure_endpoint https://<resource>.openai.azure.com --azure_api_version <api-version> \
+  --azure_chat_deployment <chat-deployment> \
+  --azure_embedding_endpoint https://<resource>.openai.azure.com \
+  --azure_embedding_deployment <embedding-deployment>
 ```
+
+If embeddings use a different API version, also set `--azure_embedding_api_version`. Legacy full operation URLs containing the deployment and `api-version` remain accepted temporarily, but emit a migration warning.
 
 To run the standard dense-retrieval/DPR-style baseline, add `--rag_type standard`. Both methods share the same loading and evaluation logic:
 

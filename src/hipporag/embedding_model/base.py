@@ -12,7 +12,7 @@ import threading
 import multiprocessing
 
 
-from ..utils.logging_utils import get_logger
+from ..utils.logging_utils import get_logger, redact_config
 from ..utils.config_utils import BaseConfig
 
 
@@ -187,6 +187,8 @@ def make_cache_embed(encode_func, cache_file_name, device):
     return wrapper
     
 class BaseEmbeddingModel:
+    query_instruction_mode = "ignored"
+
     global_config: BaseConfig
     embedding_model_name: str # Class name indicating which embedding model to use.
     embedding_config: EmbeddingConfig
@@ -198,7 +200,7 @@ class BaseEmbeddingModel:
             logger.debug("global config is not given. Using the default ExperimentConfig instance.")
             self.global_config = BaseConfig()
         else: self.global_config = global_config
-        logger.debug(f"Loading {self.__class__.__name__} with global_config: {asdict(self.global_config)}")
+        logger.debug(f"Loading {self.__class__.__name__} with global_config: {redact_config(asdict(self.global_config))}")
         
         
         self.embedding_model_name = self.global_config.embedding_model_name
@@ -207,6 +209,22 @@ class BaseEmbeddingModel:
 
     def batch_encode(self, texts: List[str], **kwargs) -> None:
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release provider resources. Provider implementations may override this no-op."""
+
+    def _normalize_embeddings(self, embeddings: np.ndarray, normalize: Optional[bool] = None) -> np.ndarray:
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if normalize is None:
+            normalize = self.global_config.embedding_return_as_normalized
+        if not isinstance(normalize, bool):
+            raise TypeError("Embedding normalization must be a boolean.")
+        if not normalize:
+            return embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        if np.any(norms == 0):
+            raise ValueError("Cannot normalize a zero embedding vector.")
+        return embeddings / norms
     
     
     def get_query_doc_scores(self, query_vec: np.ndarray, doc_vecs: np.ndarray):

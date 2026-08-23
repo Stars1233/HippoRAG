@@ -3,29 +3,36 @@ import hashlib
 import json
 import os
 import sqlite3
-from copy import deepcopy
 from typing import List, Tuple
 
-import httpx
-import openai
 from filelock import FileLock
-from openai import OpenAI
-from openai import AzureOpenAI
-from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
+from openai import AzureOpenAI, DefaultHttpxClient, OpenAI
 
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
     TextChatMessage
 )
 from ..utils.logging_utils import get_logger
-from .base import BaseLLM, LLMConfig
+from ..utils.openai_utils import local_openai_api_key, resolve_azure_openai_settings, validate_openai_base_url
+from .base import BaseLLM, LLMConfig, normalize_generation_token_params
 
 logger = get_logger(__name__)
+
+
+def _validate_azure_request_model(global_config, request_model_name, params) -> None:
+    if getattr(global_config, "azure_endpoint", None) is None:
+        return
+    if params.get("model") != request_model_name:
+        raise ValueError(f"Azure request model must match the configured deployment {request_model_name!r}.")
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, dict) and "model" in extra_body:
+        raise ValueError("Azure extra_body must not override the configured deployment model.")
 
 def cache_response(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        global_config = getattr(self, "global_config", None)
+        request_model_name = getattr(self, "request_model_name", None)
         # get messages from args or kwargs
         if args:
             messages = args[0]
@@ -34,80 +41,52 @@ def cache_response(func):
         if messages is None:
             raise ValueError("Missing required 'messages' parameter for caching.")
 
-        # get model, seed and temperature from kwargs or self.llm_config.generate_params
+        # Include every generation parameter because any of them can change the response.
         gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
-        model = kwargs.get("model", gen_params.get("model"))
-        seed = kwargs.get("seed", gen_params.get("seed"))
-        temperature = kwargs.get("temperature", gen_params.get("temperature"))
-
-        # build key data, convert to JSON string and hash to generate key_hash
-        key_data = {
-            "messages": messages,  # messages requires JSON serializable
-            "model": model,
-            "seed": seed,
-            "temperature": temperature,
-        }
+        key_data = normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
+        _validate_azure_request_model(global_config, request_model_name, key_data)
+        key_data["messages"] = messages
+        key_data["_cache_schema"] = 3
+        key_data["_provider_class"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        key_data["_endpoint"] = getattr(global_config, "azure_endpoint", None) or getattr(global_config, "llm_base_url", None)
+        key_data["_azure_api_version"] = getattr(global_config, "azure_api_version", None)
+        key_data["_azure_chat_deployment"] = getattr(global_config, "azure_chat_deployment", None)
+        if key_data.get("store") is True:
+            message, metadata = func(self, *args, **kwargs)
+            return message, metadata, False
         key_str = json.dumps(key_data, sort_keys=True, default=str)
         key_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
-        # the file name of lock, ensure mutual exclusion when accessing concurrently
-        lock_file = self.cache_file_name + ".lock"
-
-        # Try to read from SQLite cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # if the table does not exist, create it
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            conn.commit()  # commit to save the table creation
-            c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
-            row = c.fetchone()
-            conn.close()
+        database_lock_file = self.cache_file_name + ".lock"
+        key_lock_file = f"{self.cache_file_name}.{key_hash[:2]}.lock"
+        with FileLock(key_lock_file):
+            with FileLock(database_lock_file):
+                with sqlite3.connect(self.cache_file_name) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS cache (
+                            key TEXT PRIMARY KEY,
+                            message TEXT,
+                            metadata TEXT
+                        )
+                    """)
+                    cursor.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
+                    row = cursor.fetchone()
             if row is not None:
                 message, metadata_str = row
-                metadata = json.loads(metadata_str)
-                # return cached result and mark as hit
-                return message, metadata, True
+                return message, json.loads(metadata_str), True
 
-        # if cache miss, call the original function to get the result
-        result = func(self, *args, **kwargs)
-        message, metadata = result
+            message, metadata = func(self, *args, **kwargs)
 
-        # insert new result into cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # make sure the table exists again (if it doesn't exist, it would be created)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            metadata_str = json.dumps(metadata)
-            c.execute("INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
-                      (key_hash, message, metadata_str))
-            conn.commit()
-            conn.close()
+            with FileLock(database_lock_file):
+                with sqlite3.connect(self.cache_file_name) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
+                        (key_hash, message, json.dumps(metadata)),
+                    )
 
         return message, metadata, False
 
-    return wrapper
-
-def dynamic_retry_decorator(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        max_retries = getattr(self, "max_retries", 5)  
-        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))
-        decorated_func = dynamic_retry(func)
-        return decorated_func(self, *args, **kwargs)
     return wrapper
 
 class CacheOpenAI(BaseLLM):
@@ -121,7 +100,7 @@ class CacheOpenAI(BaseLLM):
                  high_throughput: bool = True,
                  **kwargs) -> None:
 
-        super().__init__()
+        super().__init__(global_config)
         self.cache_dir = cache_dir
         self.global_config = global_config
 
@@ -133,64 +112,110 @@ class CacheOpenAI(BaseLLM):
             cache_filename = f"{self.llm_name.replace('/', '_')}_cache.sqlite"
         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
 
-        self._init_llm_config()
-        if high_throughput:
-            limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
-            client = httpx.Client(limits=limits, timeout=httpx.Timeout(5*60, read=5*60))
-        else:
-            client = None
-
         self.max_retries = kwargs.get("max_retries", 2)
-
-        if self.global_config.azure_endpoint is None:
-            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
+        azure_settings = None
+        self.request_model_name = self.llm_name
+        if self.global_config.azure_endpoint is not None:
+            azure_settings = resolve_azure_openai_settings(
+                self.global_config.azure_endpoint,
+                api_version=self.global_config.azure_api_version,
+                deployment=self.global_config.azure_chat_deployment,
+                operation="chat.completions",
+            )
+            self.request_model_name = azure_settings.deployment or self.llm_name
         else:
-            self.openai_client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
-                                             azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
+            self.llm_base_url = validate_openai_base_url(self.llm_base_url, "chat/completions", "llm_base_url")
+        self._init_llm_config()
+
+        client = DefaultHttpxClient(timeout=5 * 60) if high_throughput else None
+        try:
+            if azure_settings is None:
+                self.openai_client = OpenAI(
+                    api_key=local_openai_api_key(self.llm_base_url),
+                    base_url=self.llm_base_url,
+                    http_client=client,
+                    max_retries=self.max_retries,
+                )
+            else:
+                self.openai_client = AzureOpenAI(
+                    api_version=azure_settings.api_version,
+                    azure_endpoint=azure_settings.endpoint,
+                    azure_deployment=azure_settings.deployment,
+                    http_client=client,
+                    max_retries=self.max_retries,
+                )
+        except Exception:
+            if client is not None:
+                client.close()
+            raise
 
     def _init_llm_config(self) -> None:
-        config_dict = self.global_config.__dict__
-
-        config_dict['llm_name'] = self.global_config.llm_name
-        config_dict['llm_base_url'] = self.global_config.llm_base_url
-        config_dict['generate_params'] = {
-                "model": self.global_config.llm_name,
-                "max_completion_tokens": config_dict.get("max_new_tokens", 400),
-                "n": config_dict.get("num_gen_choices", 1),
-                "seed": config_dict.get("seed", 0),
-                "temperature": config_dict.get("temperature", 0.0),
-            }
+        generate_params = {
+            "model": self.request_model_name,
+        }
+        if self.global_config.max_new_tokens is not None:
+            generate_params["max_completion_tokens"] = self.global_config.max_new_tokens
+        if self.global_config.seed is not None:
+            generate_params["seed"] = self.global_config.seed
+        if self.global_config.temperature is not None:
+            generate_params["temperature"] = self.global_config.temperature
+        config_dict = {
+            'llm_name': self.global_config.llm_name,
+            'llm_base_url': self.global_config.llm_base_url,
+            'generate_params': generate_params,
+        }
 
         self.llm_config = LLMConfig.from_dict(config_dict=config_dict)
         logger.debug(f"Init {self.__class__.__name__}'s llm_config: {self.llm_config}")
 
     @cache_response
-    @dynamic_retry_decorator
     def infer(
         self,
         messages: List[TextChatMessage],
         **kwargs
-    ) -> Tuple[List[TextChatMessage], dict]:
-        params = deepcopy(self.llm_config.generate_params)
-        if kwargs:
-            params.update(kwargs)
+    ) -> Tuple[str, dict, bool]:
+        supports_max_completion_tokens = self.global_config.llm_supports_max_completion_tokens
+        if supports_max_completion_tokens is None:
+            base_url = self.global_config.llm_base_url or "https://api.openai.com/v1"
+            supports_max_completion_tokens = self.global_config.azure_endpoint is not None or "api.openai.com" in base_url
+        target_token_key = "max_completion_tokens" if supports_max_completion_tokens else "max_tokens"
+        params = normalize_generation_token_params(self.llm_config.generate_params, kwargs, target_token_key)
+        _validate_azure_request_model(self.global_config, getattr(self, "request_model_name", getattr(self, "llm_name", None)), params)
         params["messages"] = messages
         logger.debug(f"Calling OpenAI GPT API with:\n{params}")
 
-        if 'gpt' not in params['model'] or version.parse(openai.__version__) < version.parse("1.45.0"): # if we use vllm to call openai api or if we use openai but the version is too old to use 'max_completion_tokens' argument
-            # TODO strange version change in openai protocol, but our current vllm version not changed yet
-            params['max_tokens'] = params.pop('max_completion_tokens')
-
         response = self.openai_client.chat.completions.create(**params)
-
-        response_message = response.choices[0].message.content
-        assert isinstance(response_message, str), "response_message should be a string"
-        
+        if len(response.choices) != 1:
+            raise ValueError(f"HippoRAG expected exactly one OpenAI choice, received {len(response.choices)}.")
+        choice = response.choices[0]
+        response_message = choice.message.content
+        if not isinstance(response_message, str) or not response_message:
+            refusal = getattr(choice.message, "refusal", None)
+            detail = f" Refusal: {refusal}" if refusal else ""
+            raise ValueError(f"OpenAI response did not contain non-empty text.{detail}")
+        usage = response.usage
+        if usage is None:
+            raise ValueError("OpenAI response omitted usage; HippoRAG cannot account for this request safely.")
+        total_tokens = getattr(usage, "total_tokens", None)
         metadata = {
-            "prompt_tokens": response.usage.prompt_tokens, 
-            "completion_tokens": response.usage.completion_tokens,
-            "finish_reason": response.choices[0].finish_reason,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": total_tokens if total_tokens is not None else usage.prompt_tokens + usage.completion_tokens,
+            "finish_reason": choice.finish_reason,
         }
+        for key, value in (("response_id", getattr(response, "id", None)), ("model", getattr(response, "model", None)), ("request_id", getattr(response, "_request_id", None))):
+            if value is not None:
+                metadata[key] = value
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        cached_tokens = getattr(prompt_details, "cached_tokens", None)
+        reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
+        if cached_tokens is not None:
+            metadata["cached_tokens"] = cached_tokens
+        if reasoning_tokens is not None:
+            metadata["reasoning_tokens"] = reasoning_tokens
 
         return response_message, metadata
 
+    def close(self) -> None:
+        self.openai_client.close()

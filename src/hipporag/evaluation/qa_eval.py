@@ -30,14 +30,15 @@ class QAExactMatch(BaseMetric):
                 - A dictionary with the averaged EM score.
                 - A list of dictionaries with EM scores for each example.
         """
-        assert len(gold_answers) == len(predicted_answers), "Length of gold answers and predicted answers should be the same."
+        if len(gold_answers) != len(predicted_answers):
+            raise ValueError("gold_answers and predicted_answers must have the same length.")
 
         example_eval_results = []
         total_em = 0
 
         for gold_list, predicted in zip(gold_answers, predicted_answers):
             em_scores = [1.0 if normalize_answer(gold) == normalize_answer(predicted) else 0.0 for gold in gold_list]
-            aggregated_em = aggregation_fn(em_scores)
+            aggregated_em = aggregation_fn(em_scores) if em_scores else 0.0
             example_eval_results.append({"ExactMatch": aggregated_em})
             total_em += aggregated_em
 
@@ -66,7 +67,8 @@ class QAF1Score(BaseMetric):
                 - A dictionary with the averaged F1 score.
                 - A list of dictionaries with F1 scores for each example.
         """
-        assert len(gold_answers) == len(predicted_answers), "Length of gold answers and predicted answers should be the same."
+        if len(gold_answers) != len(predicted_answers):
+            raise ValueError("gold_answers and predicted_answers must have the same length.")
 
         def compute_f1(gold: str, predicted: str) -> float:
             gold_tokens = normalize_answer(gold).split()
@@ -86,7 +88,7 @@ class QAF1Score(BaseMetric):
 
         for gold_list, predicted in zip(gold_answers, predicted_answers):
             f1_scores = [compute_f1(gold, predicted) for gold in gold_list]
-            aggregated_f1 = aggregation_fn(f1_scores)
+            aggregated_f1 = aggregation_fn(f1_scores) if f1_scores else 0.0
             example_eval_results.append({"F1": aggregated_f1})
             total_f1 += aggregated_f1
 

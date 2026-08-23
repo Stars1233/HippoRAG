@@ -1,7 +1,6 @@
 import json
 import difflib
 from pydantic import BaseModel, Field, TypeAdapter
-from openai import OpenAI
 from copy import deepcopy
 from typing import Union, Optional, List, Dict, Any, Tuple, Literal
 import re
@@ -34,8 +33,7 @@ class DSPyFilter:
         self.one_output_template = """[[ ## fact_after_filter ## ]]\n{fact_after_filter}\n\n[[ ## completed ## ]]"""
         self.message_template = self.make_template(dspy_file_path)
         self.llm_infer_fn = hipporag.extraction_llm.infer
-        self.model_name = hipporag.global_config.llm_name
-        self.default_gen_kwargs = {}
+        self.default_gen_kwargs = {"max_new_tokens": 512}
 
     def make_template(self, dspy_file_path):
         if dspy_file_path is not None:
@@ -90,11 +88,8 @@ class DSPyFilter:
         messages.append({"role": "user", "content": self.one_input_template.format(question=question, fact_before_filter=fact_before_filter)})
         # call openai
 
-        self.default_gen_kwargs['max_completion_tokens'] = 512
-
         response = self.llm_infer_fn(
             messages=messages,
-            model=self.model_name,
             **self.default_gen_kwargs
         )
 

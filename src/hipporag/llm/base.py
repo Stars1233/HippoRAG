@@ -10,7 +10,7 @@ from typing import (
 )
 
 
-from ..utils.logging_utils import get_logger
+from ..utils.logging_utils import get_logger, redact_config
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
     TextChatMessage
@@ -19,6 +19,23 @@ from ..utils.llm_utils import (
 
 
 logger = get_logger(__name__)
+
+MAX_TOKEN_ALIASES = ("max_new_tokens", "max_completion_tokens", "max_output_tokens", "max_tokens")
+
+
+def normalize_generation_token_params(default_params: Dict[str, Any], call_kwargs: Dict[str, Any], target_key: str) -> Dict[str, Any]:
+    """Normalize provider-specific max-token aliases without silently overriding callers."""
+    params = dict(default_params)
+    call_kwargs = dict(call_kwargs)
+    explicit_aliases = [alias for alias in MAX_TOKEN_ALIASES if alias in call_kwargs]
+    if len(explicit_aliases) > 1:
+        raise ValueError(f"Pass only one max-token parameter, got {explicit_aliases}.")
+    default_values = [params.pop(alias) for alias in MAX_TOKEN_ALIASES if alias in params]
+    max_tokens = call_kwargs.pop(explicit_aliases[0]) if explicit_aliases else (default_values[0] if default_values else None)
+    params.update(call_kwargs)
+    if max_tokens is not None:
+        params[target_key] = max_tokens
+    return params
 
 
 
@@ -122,7 +139,7 @@ class BaseLLM(ABC):
             logger.debug("global config is not given. Using the default ExperimentConfig instance.")
             self.global_config = BaseConfig()
         else: self.global_config = global_config
-        logger.debug(f"Loading {self.__class__.__name__} with global_config: {asdict(self.global_config)}")
+        logger.debug(f"Loading {self.__class__.__name__} with global_config: {redact_config(asdict(self.global_config))}")
         
         self.llm_name = self.global_config.llm_name
         logger.debug(f"Init {self.__class__.__name__}'s llm_name with: {self.llm_name}")
@@ -134,7 +151,7 @@ class BaseLLM(ABC):
         Each LLM model should extract its own running parameters from global_config and raise exception if any mandatory parameter is not defined in global_config.
         This function must init `self.llm_config`.
         """
-        pass
+        raise NotImplementedError(f"{self.__class__.__name__} does not initialize its LLM configuration.")
     
     
     def batch_upsert_llm_config(self, updates: Dict[str, Any]) -> None:
@@ -152,7 +169,7 @@ class BaseLLM(ABC):
         logger.debug(f"Updated {self.__class__.__name__}'s llm_config with {updates} to eventually obtain llm_config as: {self.llm_config}")
     
     
-    def ainfer(self, chat: List[TextChatMessage]) -> Tuple[List[TextChatMessage], dict]:
+    def ainfer(self, chat: List[TextChatMessage]) -> Tuple[str, dict, bool]:
         """
         Perform asynchronous inference using the LLM.
         
@@ -160,13 +177,13 @@ class BaseLLM(ABC):
             chat (List[TextChatMessage]): Input chat history for the LLM.
 
         Returns:
-            Tuple[List[TextChatMessage], dict]: The list of n (number of choices) LLM response message (a single dict of role + content), and additional metadata (all input params including input chat) as a dictionary.
+            Tuple[str, dict, bool]: Response text, token/finish metadata, and whether the response came from cache.
         """
-        pass
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement asynchronous inference.")
     
 
  
-    def infer(self, chat: List[TextChatMessage]) -> Tuple[List[TextChatMessage], dict]:
+    def infer(self, chat: List[TextChatMessage]) -> Tuple[str, dict, bool]:
         """
         Perform synchronous inference using the LLM.
         
@@ -174,9 +191,9 @@ class BaseLLM(ABC):
             chat (List[TextChatMessage]): Input chat history for the LLM.
 
         Returns:
-            Tuple[List[TextChatMessage], dict]: The list of n (number of choices) LLM response message (a single dict of role + content), and additional metadata (all input params including input chat) as a dictionary.
+            Tuple[str, dict, bool]: Response text, token/finish metadata, and whether the response came from cache.
         """
-        pass
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement synchronous inference.")
     
 
 
@@ -191,7 +208,10 @@ class BaseLLM(ABC):
             Tuple[List[List[TextChatMessage]], List[dict]]: The batch list of length-n (number of choices) list of LLM response message (a single dict of role + content), and corresponding batch of additional metadata (all input params including input chat) as a list of dictionaries.
         """
         
-        pass
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement batch inference.")
+
+    def close(self) -> None:
+        """Release provider resources. Provider implementations may override this no-op."""
         
         
 # # Example usage

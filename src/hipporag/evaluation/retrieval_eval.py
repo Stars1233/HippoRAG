@@ -21,7 +21,7 @@ class RetrievalRecall(BaseMetric):
         super().__init__(global_config)
         
     
-    def calculate_metric_scores(self, gold_docs: List[List[str]], retrieved_docs: List[List[str]], k_list: List[int] = [1, 5, 10, 20]) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+    def calculate_metric_scores(self, gold_docs: List[List[str]], retrieved_docs: List[List[str]], k_list: List[int] = (1, 5, 10, 20)) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
         """
         Calculates Recall@k for each example and pools results for all queries.
 
@@ -35,7 +35,11 @@ class RetrievalRecall(BaseMetric):
                 - A pooled dictionary with the averaged Recall@k across all examples.
                 - A list of dictionaries with Recall@k for each example.
         """
+        if len(gold_docs) != len(retrieved_docs):
+            raise ValueError("gold_docs and retrieved_docs must have the same length.")
         k_list = sorted(set(k_list))
+        if not k_list or any(k < 1 for k in k_list):
+            raise ValueError("k_list must contain at least one positive integer.")
         
         example_eval_results = []
         pooled_eval_results = {f"Recall@{k}": 0.0 for k in k_list}
@@ -66,6 +70,8 @@ class RetrievalRecall(BaseMetric):
 
         # Average pooled results over all examples
         num_examples = len(gold_docs)
+        if num_examples == 0:
+            return pooled_eval_results, example_eval_results
         for k in k_list:
             pooled_eval_results[f"Recall@{k}"] /= num_examples
 

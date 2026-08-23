@@ -6,11 +6,25 @@ from typing import Union, Optional, List, Dict, Set, Any, Tuple, Literal
 import logging
 from copy import deepcopy
 import pandas as pd
+from filelock import FileLock
 
 
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
     """Return prefix + MD5 hex digest of content. Mirrors utils.misc_utils."""
     return prefix + md5(content.encode()).hexdigest()
+
+
+def _validate_embeddings(embeddings, expected_count: int) -> np.ndarray:
+    array = np.asarray(embeddings, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError(f"Embedding model must return a 2D array, got shape {array.shape}.")
+    if array.shape[0] != expected_count:
+        raise ValueError(f"Embedding model returned {array.shape[0]} vectors for {expected_count} texts.")
+    if array.shape[1] == 0:
+        raise ValueError("Embedding vectors must have at least one dimension.")
+    if not np.isfinite(array).all():
+        raise ValueError("Embedding vectors must contain only finite values.")
+    return array
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +153,10 @@ class EmbeddingStore(BaseEmbeddingStore):
             self.hash_ids = df["hash_id"].values.tolist()
             self.texts = df["content"].values.tolist()
             self.embeddings = df["embedding"].values.tolist()
+            if len(set(self.hash_ids)) != len(self.hash_ids):
+                raise ValueError(f"Duplicate hash IDs found in {self.filename}.")
+            if self.embeddings:
+                self.embeddings = list(_validate_embeddings(self.embeddings, len(self.hash_ids)))
             self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
             self.hash_id_to_row = {
                 h: {"hash_id": h, "content": t}
@@ -146,7 +164,8 @@ class EmbeddingStore(BaseEmbeddingStore):
             }
             self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
             self.text_to_hash_id = {self.texts[idx]: h for idx, h in enumerate(self.hash_ids)}
-            assert len(self.hash_ids) == len(self.texts) == len(self.embeddings)
+            if not len(self.hash_ids) == len(self.texts) == len(self.embeddings):
+                raise ValueError(f"Embedding store columns have inconsistent lengths in {self.filename}.")
             logger.info(f"Loaded {len(self.hash_ids)} records from {self.filename}")
         else:
             self.hash_ids = []
@@ -157,13 +176,25 @@ class EmbeddingStore(BaseEmbeddingStore):
             self.hash_id_to_text = {}
             self.text_to_hash_id = {}
 
-    def _save_data(self):
+    def _save_data(self, hash_ids=None, texts=None, embeddings=None):
+        hash_ids = list(self.hash_ids if hash_ids is None else hash_ids)
+        texts = list(self.texts if texts is None else texts)
+        embeddings = list(self.embeddings if embeddings is None else embeddings)
         data_to_save = pd.DataFrame({
-            "hash_id": self.hash_ids,
-            "content": self.texts,
-            "embedding": self.embeddings
+            "hash_id": hash_ids,
+            "content": texts,
+            "embedding": embeddings,
         })
-        data_to_save.to_parquet(self.filename, index=False)
+        temporary_filename = f"{self.filename}.tmp"
+        try:
+            data_to_save.to_parquet(temporary_filename, index=False)
+            os.replace(temporary_filename, self.filename)
+        finally:
+            if os.path.exists(temporary_filename):
+                os.unlink(temporary_filename)
+        self.hash_ids = hash_ids
+        self.texts = texts
+        self.embeddings = embeddings
         self.hash_id_to_row = {
             h: {"hash_id": h, "content": t}
             for h, t, e in zip(self.hash_ids, self.texts, self.embeddings)
@@ -174,21 +205,37 @@ class EmbeddingStore(BaseEmbeddingStore):
         logger.info(f"Saved {len(self.hash_ids)} records to {self.filename}")
 
     def _upsert(self, hash_ids, texts, embeddings):
-        self.embeddings.extend(embeddings)
-        self.hash_ids.extend(hash_ids)
-        self.texts.extend(texts)
-        logger.info(f"Saving new records.")
-        self._save_data()
+        embeddings = _validate_embeddings(embeddings, len(hash_ids))
+        if len(set(hash_ids)) != len(hash_ids):
+            raise ValueError("Cannot upsert duplicate hash IDs in one batch.")
+        with FileLock(self.filename + ".lock"):
+            self._load_data()
+            new_indices = [idx for idx, hash_id in enumerate(hash_ids) if hash_id not in self.hash_id_to_idx]
+            if not new_indices:
+                return
+            embeddings = embeddings[new_indices]
+            hash_ids = [hash_ids[idx] for idx in new_indices]
+            texts = [texts[idx] for idx in new_indices]
+            if self.embeddings and embeddings.shape[1] != len(self.embeddings[0]):
+                raise ValueError(f"Embedding dimension changed from {len(self.embeddings[0])} to {embeddings.shape[1]}.")
+            logger.info("Saving new records.")
+            self._save_data(
+                hash_ids=self.hash_ids + hash_ids,
+                texts=self.texts + texts,
+                embeddings=self.embeddings + list(embeddings),
+            )
 
     def delete(self, hash_ids):
-        indices = [self.hash_id_to_idx[h] for h in hash_ids]
-        sorted_indices = np.sort(indices)[::-1]
-        for idx in sorted_indices:
-            self.hash_ids.pop(idx)
-            self.texts.pop(idx)
-            self.embeddings.pop(idx)
-        logger.info(f"Saving record after deletion.")
-        self._save_data()
+        with FileLock(self.filename + ".lock"):
+            self._load_data()
+            indices_to_delete = {self.hash_id_to_idx[h] for h in hash_ids}
+            remaining_indices = [idx for idx in range(len(self.hash_ids)) if idx not in indices_to_delete]
+            logger.info("Saving record after deletion.")
+            self._save_data(
+                hash_ids=[self.hash_ids[idx] for idx in remaining_indices],
+                texts=[self.texts[idx] for idx in remaining_indices],
+                embeddings=[self.embeddings[idx] for idx in remaining_indices],
+            )
 
     def get_row(self, hash_id: str) -> Dict:
         return self.hash_id_to_row[hash_id]

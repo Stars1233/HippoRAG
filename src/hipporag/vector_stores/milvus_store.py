@@ -16,16 +16,15 @@ Supports Milvus Lite, self-hosted Milvus, and Zilliz Cloud:
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
-import re
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import numpy as np
 
-from ..embedding_store import BaseEmbeddingStore, compute_mdhash_id
+from ..embedding_store import BaseEmbeddingStore, _validate_embeddings, compute_mdhash_id
+from .naming import build_collection_name
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +35,6 @@ _HASH_ID_MAX_LENGTH = 512
 _CONTENT_MAX_LENGTH = 65535
 _DEFAULT_BATCH_SIZE = 1000
 _VALID_CONSISTENCY_LEVELS = {"Strong", "Session", "Bounded", "Eventually"}
-
-
-def _safe_collection_name(db_path: str, namespace: str) -> str:
-    path_hash = hashlib.md5(os.path.abspath(db_path).encode()).hexdigest()[:16]
-    safe_namespace = re.sub(r"[^0-9A-Za-z_]", "_", namespace).strip("_") or "default"
-    return f"hipporag_{path_hash}_{safe_namespace[:48]}"
 
 
 def _is_local_uri(uri: str) -> bool:
@@ -148,7 +141,7 @@ class MilvusEmbeddingStore(BaseEmbeddingStore):
                 f"{sorted(_VALID_CONSISTENCY_LEVELS)}."
             )
 
-        self.collection_name = _safe_collection_name(db_path, namespace)
+        self.collection_name = build_collection_name(db_path, namespace, global_config)
         self.client = _get_milvus_client(
             uri=self.milvus_uri,
             token=self.milvus_token,
@@ -283,7 +276,7 @@ class MilvusEmbeddingStore(BaseEmbeddingStore):
             return
 
         texts_to_encode = [nodes_dict[hash_id] for hash_id in missing_ids]
-        embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        embeddings = _validate_embeddings(self.embedding_model.batch_encode(texts_to_encode), len(texts_to_encode))
         dim = len(embeddings[0]) if hasattr(embeddings[0], "__len__") else embeddings.shape[1]
         self._ensure_collection(dim=dim)
 

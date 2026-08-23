@@ -12,6 +12,8 @@ from ..prompts.linking import get_query_instruction
 
 
 class CohereEmbeddingModel(BaseEmbeddingModel):
+    query_instruction_mode = "shared"
+
     """
     To select this implementation you can initialise HippoRAG with:
         embedding_model_name="cohere.embed-english-v3"
@@ -21,7 +23,7 @@ class CohereEmbeddingModel(BaseEmbeddingModel):
 
         self.model_id = embedding_model_name
         self.embedding_type = 'float'
-        self.batch_size = 64
+        self.batch_size = global_config.embedding_batch_size
 
         self.bedrock_runtime = boto3.client(service_name='bedrock-runtime')
 
@@ -50,13 +52,16 @@ class CohereEmbeddingModel(BaseEmbeddingModel):
         return np.array(response['embeddings'][self.embedding_type])
 
     def batch_encode(self, texts: List[str], **kwargs) -> None:
+        if isinstance(texts, str):
+            texts = [texts]
         input_type = 'search_query' if (kwargs.get("instruction") in self.search_query_instr) else 'search_document'
 
         if len(texts) < self.batch_size:
-            return self.encode(texts, input_type)
-        
-        results = []
-        batch_indexes = list(range(0, len(texts), self.batch_size))
-        for i in tqdm(batch_indexes, desc="Batch Encoding"):
-            results.append(self.encode(texts[i:i + self.batch_size], input_type))
-        return np.concatenate(results)
+            results = self.encode(texts, input_type)
+        else:
+            results = []
+            batch_indexes = list(range(0, len(texts), self.batch_size))
+            for i in tqdm(batch_indexes, desc="Batch Encoding"):
+                results.append(self.encode(texts[i:i + self.batch_size], input_type))
+            results = np.concatenate(results)
+        return self._normalize_embeddings(results)

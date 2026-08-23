@@ -1,10 +1,9 @@
-from typing import Tuple, List
+from typing import List
 import torch.cuda
 import outlines.generate as generate
 import outlines.models as models
-import json
 
-from .base import BaseLLM, LLMConfig
+from .base import LLMConfig
 from ..utils.llm_utils import TextChatMessage, get_pydantic_model
 from ..utils.logging_utils import get_logger
 
@@ -27,7 +26,6 @@ def convert_text_chat_messages_to_input_string(messages: List[TextChatMessage], 
     )
     return prompt
 
-from vllm import SamplingParams
 class TransformersOffline:
 
     def _init_llm_config(self) -> None:
@@ -37,10 +35,11 @@ class TransformersOffline:
         model_name = kwargs.get('model_name', global_config.llm_name)
         if model_name is None:
             model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+        model_name = model_name.removeprefix("Transformers/")
         import os
         self.model_name = model_name
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', torch_dtype = torch.bfloat16)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = kwargs.get("model") or AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', torch_dtype=torch.bfloat16)
+        self.tokenizer = kwargs.get("tokenizer") or AutoTokenizer.from_pretrained(model_name)
         
         if cache_filename is None:
             cache_filename = f'{model_name.replace("/", "_")}_cache.sqlite'
@@ -48,13 +47,16 @@ class TransformersOffline:
             cache_dir = os.path.join(global_config.save_dir, "llm_cache")
         self.cache_file_name = os.path.join(cache_dir, cache_filename)
     
+    def _generate_text(self, prompt_text: str, max_tokens: int) -> str:
+        model_inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
+        generated = self.model.generate(**model_inputs, max_new_tokens=max_tokens, do_sample=False)
+        completion_ids = generated[:, model_inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(completion_ids[0], skip_special_tokens=True)
+
     def infer(self, messages: List[TextChatMessage], max_tokens=2048):
         logger.info(f"Calling Transformers offline, # of messages {len(messages)}")
-        messages_list = [messages]
-        prompt_text = convert_text_chat_messages_to_input_string(messages_list, self.tokenizer)
-        input_ids = self.tokenizer.encode(prompt_text)
-        transformers_output = self.model.generate(input_ids, max_new_tokens=max_tokens)
-        response = transformers_output[0]['generated_text']
+        prompt_text = convert_text_chat_messages_to_input_string(messages, self.tokenizer)
+        response = self._generate_text(prompt_text, max_tokens)
         prompt_tokens = len(self.tokenizer.encode(prompt_text))
         completion_tokens = len(self.tokenizer.encode(response))
         metadata = {
@@ -78,12 +80,11 @@ class TransformersOffline:
             for i in range(0, len(all_prompt_texts), 4):
                 transformers_output = generator(all_prompt_texts[i:i+4], max_tokens=max_tokens)
                 transformers_outputs.extend(transformers_output)
+            all_responses = [completion.model_dump_json() for completion in transformers_outputs]
         else:
-            transformers_outputs = []
-            for i in range(0, len(all_prompt_texts), 4):
-                transformers_output = self.model.generate(all_prompt_texts[i:i+4], max_tokens=max_tokens)
-                transformers_outputs.extend(transformers_output)
-        all_responses = [completion.model_dump_json() for completion in transformers_outputs]
+            all_responses = [self._generate_text(prompt_text, max_tokens) for prompt_text in all_prompt_texts]
+        if len(all_responses) != len(messages_list):
+            raise RuntimeError(f"Transformers offline returned {len(all_responses)} outputs for {len(messages_list)} prompts.")
         all_prompt_tokens = [len(self.tokenizer.encode(prompt)) for prompt in all_prompt_texts]
         all_completion_tokens = [len(self.tokenizer.encode(response)) for response in all_responses]
 

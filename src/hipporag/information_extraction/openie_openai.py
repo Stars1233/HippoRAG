@@ -1,5 +1,4 @@
 import json
-import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, TypedDict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,20 +26,40 @@ class LLMInput:
     input_message: List[Dict]
 
 
+def _extract_json_list_field(response: str, field_name: str) -> List:
+    decoder = json.JSONDecoder()
+    for start_index, character in enumerate(response):
+        if character != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(response[start_index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or field_name not in payload:
+            continue
+        value = payload[field_name]
+        if not isinstance(value, list):
+            raise ValueError(f"OpenIE response field {field_name!r} must be a list.")
+        return value
+    raise ValueError(f"OpenIE response does not contain a valid JSON object with {field_name!r}.")
+
+
 def _extract_ner_from_response(real_response):
-    pattern = r'\{[^{}]*"named_entities"\s*:\s*\[[^\]]*\][^{}]*\}'
-    match = re.search(pattern, real_response, re.DOTALL)
-    if match is None:
-        # If pattern doesn't match, return an empty list
-        return []
-    return eval(match.group())["named_entities"]
+    return _extract_json_list_field(real_response, "named_entities")
 
 
 class OpenIE:
-    def __init__(self, llm_model: CacheOpenAI):
+    def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, ner_max_tokens: int = 512, triple_max_tokens: int = 2048):
         # Init prompt template manager
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1.")
+        if ner_max_tokens < 1 or triple_max_tokens < 1:
+            raise ValueError("OpenIE token limits must be at least 1.")
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = llm_model
+        self.max_workers = max_workers
+        self.ner_max_tokens = ner_max_tokens
+        self.triple_max_tokens = triple_max_tokens
 
     def ner(self, chunk_key: str, passage: str) -> NerRawOutput:
         # PREPROCESSING
@@ -49,11 +68,16 @@ class OpenIE:
         metadata = {}
         try:
             # LLM INFERENCE
+            inference_kwargs = {"max_new_tokens": self.ner_max_tokens}
+            response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
+            if response_format is not None:
+                inference_kwargs["response_format"] = response_format
             raw_response, metadata, cache_hit = self.llm_model.infer(
                 messages=ner_input_message,
+                **inference_kwargs,
             )
             metadata['cache_hit'] = cache_hit
-            if metadata['finish_reason'] == 'length':
+            if metadata.get('finish_reason') == 'length':
                 real_response = fix_broken_generated_json(raw_response)
             else:
                 real_response = raw_response
@@ -80,12 +104,7 @@ class OpenIE:
 
     def triple_extraction(self, chunk_key: str, passage: str, named_entities: List[str]) -> TripleRawOutput:
         def _extract_triples_from_response(real_response):
-            pattern = r'\{[^{}]*"triples"\s*:\s*\[[^\]]*\][^{}]*\}'
-            match = re.search(pattern, real_response, re.DOTALL)
-            if match is None:
-                # If pattern doesn't match, return an empty list
-                return []
-            return eval(match.group())["triples"]
+            return _extract_json_list_field(real_response, "triples")
 
         # PREPROCESSING
         messages = self.prompt_template_manager.render(
@@ -98,11 +117,16 @@ class OpenIE:
         metadata = {}
         try:
             # LLM INFERENCE
+            inference_kwargs = {"max_new_tokens": self.triple_max_tokens}
+            response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
+            if response_format is not None:
+                inference_kwargs["response_format"] = response_format
             raw_response, metadata, cache_hit = self.llm_model.infer(
                 messages=messages,
+                **inference_kwargs,
             )
             metadata['cache_hit'] = cache_hit
-            if metadata['finish_reason'] == 'length':
+            if metadata.get('finish_reason') == 'length':
                 real_response = fix_broken_generated_json(raw_response)
             else:
                 real_response = raw_response
@@ -150,11 +174,13 @@ class OpenIE:
         chunk_passages = {chunk_key: chunk["content"] for chunk_key, chunk in chunks.items()}
 
         ner_results_list = []
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
+        logical_prompt_tokens = 0
+        logical_completion_tokens = 0
+        billable_prompt_tokens = 0
+        billable_completion_tokens = 0
         num_cache_hit = 0
 
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Create NER futures for each chunk
             ner_futures = {
                 executor.submit(self.ner, chunk_key, passage): chunk_key
@@ -167,20 +193,32 @@ class OpenIE:
                 ner_results_list.append(result)
                 # Update metrics based on the metadata from the result
                 metadata = result.metadata
-                total_prompt_tokens += metadata.get('prompt_tokens', 0)
-                total_completion_tokens += metadata.get('completion_tokens', 0)
+                prompt_tokens = metadata.get('prompt_tokens', 0)
+                completion_tokens = metadata.get('completion_tokens', 0)
+                logical_prompt_tokens += prompt_tokens
+                logical_completion_tokens += completion_tokens
                 if metadata.get('cache_hit'):
                     num_cache_hit += 1
+                else:
+                    billable_prompt_tokens += prompt_tokens
+                    billable_completion_tokens += completion_tokens
 
                 pbar.set_postfix({
-                    'total_prompt_tokens': total_prompt_tokens,
-                    'total_completion_tokens': total_completion_tokens,
+                    'billable_prompt_tokens': billable_prompt_tokens,
+                    'billable_completion_tokens': billable_completion_tokens,
+                    'logical_prompt_tokens': logical_prompt_tokens,
+                    'logical_completion_tokens': logical_completion_tokens,
                     'num_cache_hit': num_cache_hit
                 })
 
+        failed_ner_chunk_ids = [result.chunk_id for result in ner_results_list if result.metadata.get("error")]
+        if failed_ner_chunk_ids:
+            raise RuntimeError(f"NER failed for {len(failed_ner_chunk_ids)} chunk(s): {failed_ner_chunk_ids}")
+
         triple_results_list = []
-        total_prompt_tokens, total_completion_tokens, num_cache_hit = 0, 0, 0
-        with ThreadPoolExecutor() as executor:
+        logical_prompt_tokens, logical_completion_tokens = 0, 0
+        billable_prompt_tokens, billable_completion_tokens, num_cache_hit = 0, 0, 0
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Create triple extraction futures for each chunk
             re_futures = {
                 executor.submit(self.triple_extraction, ner_result.chunk_id,
@@ -194,15 +232,26 @@ class OpenIE:
                 result = future.result()
                 triple_results_list.append(result)
                 metadata = result.metadata
-                total_prompt_tokens += metadata.get('prompt_tokens', 0)
-                total_completion_tokens += metadata.get('completion_tokens', 0)
+                prompt_tokens = metadata.get('prompt_tokens', 0)
+                completion_tokens = metadata.get('completion_tokens', 0)
+                logical_prompt_tokens += prompt_tokens
+                logical_completion_tokens += completion_tokens
                 if metadata.get('cache_hit'):
                     num_cache_hit += 1
+                else:
+                    billable_prompt_tokens += prompt_tokens
+                    billable_completion_tokens += completion_tokens
                 pbar.set_postfix({
-                    'total_prompt_tokens': total_prompt_tokens,
-                    'total_completion_tokens': total_completion_tokens,
+                    'billable_prompt_tokens': billable_prompt_tokens,
+                    'billable_completion_tokens': billable_completion_tokens,
+                    'logical_prompt_tokens': logical_prompt_tokens,
+                    'logical_completion_tokens': logical_completion_tokens,
                     'num_cache_hit': num_cache_hit
                 })
+
+        failed_triple_chunk_ids = [result.chunk_id for result in triple_results_list if result.metadata.get("error")]
+        if failed_triple_chunk_ids:
+            raise RuntimeError(f"Triple extraction failed for {len(failed_triple_chunk_ids)} chunk(s): {failed_triple_chunk_ids}")
 
         ner_results_dict = {res.chunk_id: res for res in ner_results_list}
         triple_results_dict = {res.chunk_id: res for res in triple_results_list}

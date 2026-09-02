@@ -1,4 +1,6 @@
+import ast
 import json
+import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, TypedDict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,22 +28,86 @@ class LLMInput:
     input_message: List[Dict]
 
 
+def _clean_markdown_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = cleaned.strip()
+    return cleaned
+
+
 def _extract_json_list_field(response: str, field_name: str) -> List:
-    decoder = json.JSONDecoder()
-    for start_index, character in enumerate(response):
-        if character != "{":
-            continue
-        try:
-            payload, _ = decoder.raw_decode(response[start_index:])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or field_name not in payload:
-            continue
-        value = payload[field_name]
-        if not isinstance(value, list):
-            raise ValueError(f"OpenIE response field {field_name!r} must be a list.")
-        return value
-    raise ValueError(f"OpenIE response does not contain a valid JSON object with {field_name!r}.")
+    if not response or not response.strip():
+        return []
+
+    cleaned = _clean_markdown_fence(response)
+
+    # 1. Try direct json parse if the whole response is a JSON dict or list
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if field_name in data and isinstance(data[field_name], list):
+                return data[field_name]
+            for alt_key in ["named_entities", "entities", "named_entity_list", "triples", "results"]:
+                if alt_key in data and isinstance(data[alt_key], list):
+                    return data[alt_key]
+    except Exception:
+        pass
+
+    # 2. Try raw_decode iteratively on the cleaned response and original response
+    for target in [cleaned, response]:
+        decoder = json.JSONDecoder()
+        for start_index, character in enumerate(target):
+            if character not in ("{", "["):
+                continue
+            try:
+                payload, _ = decoder.raw_decode(target[start_index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                if field_name in payload and isinstance(payload[field_name], list):
+                    return payload[field_name]
+                for alt_key in ["named_entities", "entities", "named_entity_list", "triples", "results"]:
+                    if alt_key in payload and isinstance(payload[alt_key], list):
+                        return payload[alt_key]
+
+    # 3. Regex search for object with field_name or standalone array
+    patterns = [
+        rf'\{{[\s\S]*?"(?:{field_name}|entities|named_entities|triples)"\s*:\s*(\[[\s\S]*?\])[\s\S]*?\}}',
+        r'\[[\s\S]*?\]'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, response)
+        if match:
+            target_str = match.group(1) if match.lastindex else match.group(0)
+            try:
+                data = json.loads(target_str)
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                try:
+                    data = ast.literal_eval(target_str)
+                    if isinstance(data, list):
+                        return data
+                except Exception:
+                    pass
+
+    # 4. Fallback: ast.literal_eval on entire cleaned string if single quotes used
+    try:
+        data = ast.literal_eval(cleaned)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and field_name in data and isinstance(data[field_name], list):
+            return data[field_name]
+    except Exception:
+        pass
+
+    raise ValueError(f"OpenIE response does not contain a valid JSON object or list with {field_name!r}.")
 
 
 def _extract_ner_from_response(real_response):

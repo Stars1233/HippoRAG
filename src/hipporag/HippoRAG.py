@@ -358,6 +358,8 @@ class HippoRAG:
         elif self.global_config.openie_mode == "online" and self.global_config.llm_name.startswith("bedrock-mantle/"):
             endpoint = self.global_config.llm_base_url
             region = self.global_config.bedrock_region or os.getenv("AWS_REGION_NAME") or os.getenv("AWS_DEFAULT_REGION")
+        elif self.global_config.openie_mode == "online" and self.global_config.llm_name.startswith("orcarouter/"):
+            endpoint = self.global_config.llm_base_url or "https://api.orcarouter.ai/v1"
         elif self.global_config.openie_mode == "online" and not self.global_config.llm_name.startswith("Transformers/"):
             endpoint = self.global_config.azure_endpoint or self.global_config.llm_base_url or "https://api.openai.com/v1"
         if self.global_config.openie_mode == "online":

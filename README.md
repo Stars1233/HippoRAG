@@ -158,6 +158,27 @@ hipporag = HippoRAG(
 
 The Mantle endpoint and model availability are region-specific. HippoRAG requires an explicit endpoint and raises an error if the Bedrock API key is missing. To use an existing AWS profile instead, construct a `BaseConfig` with `bedrock_mantle_auth='aws_credentials'`, `bedrock_aws_profile='<profile>'`, and `bedrock_region='<region>'`; this explicitly enables SigV4 authentication. Mantle response storage is disabled by default (`store=False`); pass `store=True` to `infer` only when server-side conversation state is required.
 
+### OrcaRouter
+
+OrcaRouter is an OpenAI-compatible AI gateway that routes HippoRAG's requests across models from OpenAI, Anthropic, Google Gemini, DeepSeek, and more through a single endpoint. Prefix the OrcaRouter model ID with `orcarouter/` to use it as a named provider, as shown in `examples/demo_orcarouter.py`:
+
+```sh
+export ORCAROUTER_API_KEY=<your OrcaRouter API key>
+python examples/demo_orcarouter.py
+```
+
+The corresponding configuration is:
+
+```python
+hipporag = HippoRAG(
+    save_dir='outputs/orcarouter',
+    llm_model_name='orcarouter/anthropic/claude-opus-4.8',
+    embedding_model_name=embedding_model_name,
+)
+```
+
+Model names use the `vendor/model` namespace (for example `orcarouter/anthropic/claude-opus-4.8` or `orcarouter/google/gemini-2.5-flash`), and `orcarouter/auto` lets the router pick a live model automatically. HippoRAG uses the default OrcaRouter endpoint `https://api.orcarouter.ai/v1`; set `llm_base_url` explicitly to override it.
+
 ### Local Deployment (vLLM)
 
 This simple example will illustrate how to use `hipporag` with any vLLM-compatible locally deployed LLM.
@@ -263,6 +284,7 @@ Provider integration scripts exercise indexing, graph reload, incremental update
 | --- | --- |
 | OpenAI | `python tests/integration/run_openai.py` |
 | Azure OpenAI | `python tests/integration/run_azure.py --azure_endpoint <resource-url> --azure_api_version <version> --azure_embedding_endpoint <resource-url>` |
+| OrcaRouter | `python tests/integration/run_orcarouter.py` |
 | Local vLLM | `python tests/integration/run_local.py` |
 | Transformers | `python tests/integration/run_transformers.py` |
 

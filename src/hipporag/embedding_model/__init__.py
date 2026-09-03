@@ -55,7 +55,12 @@ def _get_embedding_model_class(embedding_model_name: str = "nvidia/NV-Embed-v2",
     elif "cohere" in embedding_model_name:
         class_name = "CohereEmbeddingModel"
     else:
-        raise ValueError(f"Unknown embedding model name: {embedding_model_name}")
+        # Fallback to OpenAIEmbeddingModel for custom OpenAI-compatible/vLLM endpoints
+        logger.info(
+            f"Embedding model '{embedding_model_name}' not matched with local HF models. "
+            f"Defaulting to OpenAIEmbeddingModel."
+        )
+        class_name = "OpenAIEmbeddingModel" 
     return __getattr__(class_name)
 
 

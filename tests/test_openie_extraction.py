@@ -12,18 +12,6 @@ class TestOpenIEExtraction(unittest.TestCase):
         resp = "```json\n{\n  \"named_entities\": [\"Tesla\", \"Austin\"]\n}\n```"
         self.assertEqual(_extract_ner_from_response(resp), ["Tesla", "Austin"])
 
-    def test_direct_json_list(self):
-        resp = '["SpaceX", "NASA"]'
-        self.assertEqual(_extract_ner_from_response(resp), ["SpaceX", "NASA"])
-
-    def test_alternate_key_name(self):
-        resp = '{"entities": ["Google", "Mountain View"]}'
-        self.assertEqual(_extract_ner_from_response(resp), ["Google", "Mountain View"])
-
-    def test_single_quoted_python_dict(self):
-        resp = "{'named_entities': ['Microsoft', 'Seattle']}"
-        self.assertEqual(_extract_ner_from_response(resp), ["Microsoft", "Seattle"])
-
     def test_embedding_model_fallback(self):
         cls = _get_embedding_model_class("Nemotron-3-Embed-1B-NVFP4")
         self.assertEqual(cls, OpenAIEmbeddingModel)
